@@ -11,7 +11,7 @@ import uuid
 
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from typing import Any
 from sse_starlette import EventSourceResponse, ServerSentEvent
@@ -871,6 +871,55 @@ async def execution_status(request: Request, execution_id: str):
     return result
 
 
+@router.get(
+    "/executions/{execution_id}/events",
+    dependencies=[Depends(require_scope("agent:execute"))],
+)
+async def execution_events(
+    request: Request,
+    execution_id: str,
+    after_event_id: int = 0,
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    """Return the persisted event timeline for a single execution."""
+    pool = request.app.state.db_pool
+    execution = await get_execution(pool, execution_id)
+    if not execution:
+        raise HTTPException(status_code=404, detail="execution not found")
+    thread_key = execution["thread_key"]
+    _enforce_sandbox_thread_scope(request, thread_key)
+
+    rows = await pool.fetch(
+        "SELECT event_id, event_kind, event_json, created_at "
+        "FROM agent_execution_events "
+        "WHERE execution_id = $1 AND event_id > $2 "
+        "ORDER BY event_id ASC LIMIT $3",
+        execution_id,
+        max(0, after_event_id),
+        limit + 1,
+    )
+    page = rows[:limit]
+    return {
+        "execution_id": execution_id,
+        "thread_key": thread_key,
+        "events": [
+            {
+                "event_id": int(row["event_id"]),
+                "event_kind": row["event_kind"],
+                "event_json": _decode_event_json(row["event_json"]),
+                "created_at": row["created_at"].isoformat()
+                if row["created_at"]
+                else None,
+            }
+            for row in page
+        ],
+        "has_more": len(rows) > limit,
+        "next_after_event_id": int(page[-1]["event_id"])
+        if page
+        else max(0, after_event_id),
+    }
+
+
 @router.get("/threads/{thread_key}/executions", dependencies=[Depends(require_scope("agent:execute"))])
 async def thread_executions(request: Request, thread_key: str, limit: int = 20):
     _enforce_sandbox_thread_scope(request, thread_key)
@@ -955,6 +1004,17 @@ async def thread_events(
         ping_message_factory=lambda: ServerSentEvent(comment="keepalive"),
         sep="\n",
     )
+
+
+def _decode_event_json(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return _json.loads(value)
+        except Exception:
+            return {"type": "unknown", "raw": value}
+    return value
 
 
 class ReleaseRequest(BaseModel):

@@ -13,6 +13,99 @@ def _auth(api_key: str) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
+async def test_execution_events_endpoint_lists_single_execution_timeline(
+    client,
+    db_pool,
+    api_key: str,
+):
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    thread_key = f"slack:C-router:{uuid.uuid4().hex}"
+
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status"
+        ") VALUES ($1, $2, 1, 'exec-events', 'hash-events', 'running')",
+        execution_id,
+        thread_key,
+    )
+    first_event_id = await db_pool.fetchval(
+        "INSERT INTO agent_execution_events (thread_key, execution_id, event_kind, event_json) "
+        "VALUES ($1, $2, 'execution_state', $3::jsonb) RETURNING event_id",
+        thread_key,
+        execution_id,
+        json.dumps({"type": "execution.state", "status": "running"}),
+    )
+    second_event_id = await db_pool.fetchval(
+        "INSERT INTO agent_execution_events (thread_key, execution_id, event_kind, event_json) "
+        "VALUES ($1, $2, 'llm_turn', $3::jsonb) RETURNING event_id",
+        thread_key,
+        execution_id,
+        json.dumps({"type": "llm.turn", "round": 1}),
+    )
+
+    first_page = await client.get(
+        f"/agent/executions/{execution_id}/events",
+        headers=_auth(api_key),
+        params={"limit": 1},
+    )
+    assert first_page.status_code == 200
+    body = first_page.json()
+    assert body["execution_id"] == execution_id
+    assert body["thread_key"] == thread_key
+    assert body["has_more"] is True
+    assert body["next_after_event_id"] == int(first_event_id)
+    assert body["events"] == [
+        {
+            "event_id": int(first_event_id),
+            "event_kind": "execution_state",
+            "event_json": {"type": "execution.state", "status": "running"},
+            "created_at": body["events"][0]["created_at"],
+        }
+    ]
+
+    second_page = await client.get(
+        f"/agent/executions/{execution_id}/events",
+        headers=_auth(api_key),
+        params={"after_event_id": int(first_event_id)},
+    )
+    assert second_page.status_code == 200
+    body = second_page.json()
+    assert body["has_more"] is False
+    assert body["next_after_event_id"] == int(second_event_id)
+    assert [event["event_kind"] for event in body["events"]] == ["llm_turn"]
+    assert body["events"][0]["event_json"] == {"type": "llm.turn", "round": 1}
+
+
+@pytest.mark.asyncio
+async def test_execution_events_endpoint_enforces_sandbox_thread_scope(
+    client,
+    db_pool,
+):
+    from api.deps import mint_sandbox_token
+
+    execution_id = f"exe-{uuid.uuid4().hex[:12]}"
+    thread_key = f"slack:C-router:{uuid.uuid4().hex}"
+    await db_pool.execute(
+        "INSERT INTO agent_execution_requests ("
+        "execution_id, thread_key, assignment_generation, execute_id, request_hash, status"
+        ") VALUES ($1, $2, 1, 'exec-events', 'hash-events', 'running')",
+        execution_id,
+        thread_key,
+    )
+
+    token = mint_sandbox_token(
+        f"slack:C-other:{uuid.uuid4().hex}",
+        f"container-{uuid.uuid4().hex}",
+    )
+    response = await client.get(
+        f"/agent/executions/{execution_id}/events",
+        headers=_auth(token),
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Sandbox token is scoped to a different thread"
+
+
+@pytest.mark.asyncio
 async def test_final_delivery_lease_heartbeat_reclaim_and_retry_backoff(
     client,
     db_pool,
